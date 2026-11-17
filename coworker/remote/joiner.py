@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
 
+from .. import services
+from ..services import launchd, systemd_user
 from . import channel as ch
 from .identity import KEY_FILENAME, SEAL_KEY_FILENAME, MachineIdentity, load_or_create
 
@@ -903,47 +905,27 @@ _UNIT_PREFIX = "openworker"
 def unit_name_for(machine_name: str) -> str:
     """`openworker-<machine>.service` — one unit per joined identity, so two
     installs on one box can never silently share a name (or a state dir)."""
-    slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in (machine_name or "")).strip("-")
-    return f"{_UNIT_PREFIX}-{slug}.service" if slug else SERVICE_UNIT_NAME
+    name = services.slug(machine_name)
+    return f"{_UNIT_PREFIX}-{name}.service" if name else SERVICE_UNIT_NAME
 
 
 def _systemd_unit(state: Path, exe: str, name: str = "") -> str:
     """A user unit running `up`: restart forever, state dir pinned explicitly so
     the unit survives shells/relogins with a different environment."""
     label = f" ({name})" if name else ""
-    return (
-        "[Unit]\n"
-        f"Description=OpenWorker headless (joined machine{label})\n"
+    return systemd_user.render_unit(
+        description=f"OpenWorker headless (joined machine{label})",
+        exec_start=f"{exe} up",
+        environment={"COWORKER_STATE_DIR": str(state)},
         # After the OpenShell gateway too, when it is installed: started before it, the
         # first sessions after a reboot wait for it (seen 2026-09-29, a 7 s gap).
-        "After=network-online.target openshell-gateway.service\n"
-        "Wants=network-online.target\n"
-        "\n"
-        "[Service]\n"
-        f"ExecStart={exe} up\n"
-        f"Environment=COWORKER_STATE_DIR={state}\n"
-        "Restart=always\n"
-        "RestartSec=5\n"
-        "\n"
-        "[Install]\n"
-        "WantedBy=default.target\n"
+        after=("network-online.target", "openshell-gateway.service"),
+        wants=("network-online.target",),
     )
 
 
-def _linger_on() -> bool:
-    """Whether this user's services keep running without a login session (`loginctl
-    enable-linger`). Unknown counts as off, so the reminder is printed."""
-    import getpass
-    import subprocess
-
-    try:
-        done = subprocess.run(
-            ["loginctl", "show-user", getpass.getuser(), "-p", "Linger"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return done.returncode == 0 and done.stdout.strip() == "Linger=yes"
+_linger_on = systemd_user.linger_on
+_systemctl_user = systemd_user.systemctl_user
 
 
 def installed_units(unit_dir: Path) -> list[dict]:
@@ -951,30 +933,13 @@ def installed_units(unit_dir: Path) -> list[dict]:
     pins — what `service install` reports so a stale twin is visible, not a
     mystery process that returns after every kill."""
     rows = []
-    for path in sorted(unit_dir.glob(f"{_UNIT_PREFIX}*.service")):
-        state = ""
+    for path in systemd_user.find_units(unit_dir, _UNIT_PREFIX):
         try:
-            for line in path.read_text().splitlines():
-                if line.startswith("Environment=COWORKER_STATE_DIR="):
-                    state = line.split("=", 2)[2].strip()
+            env = systemd_user.unit_environment(path.read_text())
         except OSError:
             continue
-        rows.append({"unit": path.name, "state_dir": state, "path": str(path)})
+        rows.append({"unit": path.name, "state_dir": env.get("COWORKER_STATE_DIR", ""), "path": str(path)})
     return rows
-
-
-def _systemctl_user(*args: str) -> bool:
-    import subprocess
-
-    try:
-        return (
-            subprocess.run(
-                ["systemctl", "--user", *args], capture_output=True, timeout=15
-            ).returncode
-            == 0
-        )
-    except (OSError, Exception):
-        return False
 
 
 def _cmd_service(state: Path, args, platform: Optional[str] = None, home: Optional[Path] = None) -> int:
@@ -989,7 +954,7 @@ def _cmd_service(state: Path, args, platform: Optional[str] = None, home: Option
             file=sys.stderr,
         )
         return 2
-    unit_dir = home / ".config" / "systemd" / "user"
+    unit_dir = systemd_user.unit_dir(home)
     cfg = load_remote_config(state)
     derived = unit_name_for(str(cfg.get("name") or "")) if cfg else SERVICE_UNIT_NAME
     if args.service_command == "uninstall":
@@ -1070,8 +1035,8 @@ _AGENT_PREFIX = "com.openworker.machine"
 
 def agent_label_for(machine_name: str) -> str:
     """`com.openworker.machine.<machine>` — one agent per joined identity."""
-    slug = "".join(ch if ch.isalnum() or ch in "-_" else "-" for ch in (machine_name or "")).strip("-")
-    return f"{_AGENT_PREFIX}.{slug}" if slug else _AGENT_PREFIX
+    name = services.slug(machine_name)
+    return f"{_AGENT_PREFIX}.{name}" if name else _AGENT_PREFIX
 
 
 def service_log_path(state: Path) -> Path:
@@ -1082,37 +1047,25 @@ def _launchd_plist(state: Path, exe: str, label: str) -> bytes:
     """A per-user agent running `up`: started at login, restarted when it exits, state dir
     pinned. launchd starts agents with a bare PATH, and a coworker runs git, node and the
     like — so the PATH of the shell that installed the service is carried over."""
-    import plistlib
     import shlex
 
-    log = str(service_log_path(state))
-    return plistlib.dumps(
-        {
-            "Label": label,
-            "ProgramArguments": [*shlex.split(exe), "up"],
-            "EnvironmentVariables": {
-                "COWORKER_STATE_DIR": str(state),
-                "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
-            },
-            "RunAtLoad": True,
-            "KeepAlive": True,
-            "ThrottleInterval": 5,
-            "ProcessType": "Background",
-            "StandardOutPath": log,
-            "StandardErrorPath": log,
-        }
+    return launchd.render_plist(
+        label=label,
+        program_arguments=[*shlex.split(exe), "up"],
+        environment={
+            "COWORKER_STATE_DIR": str(state),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+        },
+        log_path=str(service_log_path(state)),
     )
 
 
 def installed_agents(agent_dir: Path) -> list[dict]:
     """Every OpenWorker launchd agent of this user with the state dir it pins."""
-    import plistlib
-
     rows = []
-    for path in sorted(agent_dir.glob(f"{_AGENT_PREFIX}*.plist")):
-        try:
-            data = plistlib.loads(path.read_bytes())
-        except Exception:
+    for path in launchd.find_agents(agent_dir, _AGENT_PREFIX):
+        data = launchd.read_plist(path)
+        if data is None:
             continue
         rows.append(
             {
@@ -1124,20 +1077,14 @@ def installed_agents(agent_dir: Path) -> list[dict]:
     return rows
 
 
-def _launchctl(*args: str) -> bool:
-    import subprocess
-
-    try:
-        return subprocess.run(["launchctl", *args], capture_output=True, timeout=15).returncode == 0
-    except (OSError, Exception):
-        return False
+_launchctl = launchd.launchctl
 
 
 def _cmd_service_macos(state: Path, args, home: Path) -> int:
-    agent_dir = home / "Library" / "LaunchAgents"
+    agent_dir = launchd.agent_dir(home)
     cfg = load_remote_config(state)
     derived = agent_label_for(str(cfg.get("name") or "")) if cfg else _AGENT_PREFIX
-    domain = f"gui/{os.getuid()}"
+    domain = launchd.gui_domain()
     if args.service_command == "uninstall":
         wanted = getattr(args, "unit", None) or derived
         plist = agent_dir / f"{wanted}.plist"
@@ -1216,7 +1163,7 @@ def logs_command(
     if platform == "linux":
         cfg = load_remote_config(state)
         name = unit or (unit_name_for(str(cfg.get("name") or "")) if cfg else SERVICE_UNIT_NAME)
-        return ["journalctl", "--user", "-u", name, "-n", n, *(["-f"] if follow else [])]
+        return systemd_user.journal_command(name, lines, follow)
     if platform == "darwin":
         return ["tail", "-n", n, *(["-f"] if follow else []), str(service_log_path(state))]
     return None
